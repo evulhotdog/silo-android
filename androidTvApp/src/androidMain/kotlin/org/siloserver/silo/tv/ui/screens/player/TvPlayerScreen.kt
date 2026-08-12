@@ -360,6 +360,21 @@ fun TvPlayerScreen(
             skipSeekFeedback = null
         }
     }
+    // Side chevron ripple, bumped once per D-pad quick-skip (not scrubber/
+    // transport-button skips — see performRelativeSeek's showVisualizer).
+    // Self-hides inside TvSeekVisualizer, so unlike skipSeekFeedback above
+    // this needs no matching auto-hide effect here.
+    var seekVisualizerCue by remember { mutableStateOf<TvSeekVisualizerCue?>(null) }
+    // Running total for a rapid quick-skip burst ("30s" instead of
+    // restarting at "10s" per tap). Drops back to 0 after a quiet gap of
+    // SEEK_VISUALIZER_VISIBLE_MS, mirroring the ripple's own hide timer.
+    var accumulatedSeekSec by remember { mutableStateOf(0) }
+    LaunchedEffect(seekVisualizerCue?.nonce) {
+        if (seekVisualizerCue != null) {
+            delay(SEEK_VISUALIZER_VISIBLE_MS)
+            accumulatedSeekSec = 0
+        }
+    }
     val startupStallDetector = remember { PlaybackStartupStallDetector() }
     val postResumeStallDetector = remember { PostResumeVideoStallDetector() }
     var dvSanitizerReported by remember { mutableStateOf(false) }
@@ -636,6 +651,11 @@ fun TvPlayerScreen(
         snapshot: RoomSnapshot?,
         revealControls: Boolean,
         captureQuickSkipBurst: Boolean = false,
+        // False for the scrubber's idle-tap skip and the transport cluster's
+        // skip buttons: focus already marks where those skips are happening,
+        // so the ripple (which exists to surface an otherwise-invisible
+        // hidden-controls D-pad skip) would be redundant there.
+        showVisualizer: Boolean = true,
     ): Boolean {
         val controller = mediaController ?: return true
         val playerState = viewModel.uiState.value
@@ -656,12 +676,26 @@ fun TvPlayerScreen(
         if (roomController != null) {
             roomController.onUserSeek(targetSec)
         }
+        if (showVisualizer) {
+            val direction = if (deltaMs < 0) -1 else 1
+            val deltaSec = ((if (deltaMs < 0) -deltaMs else deltaMs) / 1000L).toInt()
+            accumulatedSeekSec = if (seekVisualizerCue?.direction == direction) {
+                accumulatedSeekSec + deltaSec
+            } else {
+                deltaSec
+            }
+            seekVisualizerCue = TvSeekVisualizerCue(
+                direction = direction,
+                nonce = (seekVisualizerCue?.nonce ?: 0) + 1,
+                accumulatedSeconds = accumulatedSeekSec,
+            )
+        }
         if (revealControls) {
             if (!playerState.showControls) {
                 requestIdleOverlayFocus(TvIdleOverlayFocusTarget.Scrubber)
             }
             viewModel.setControlsVisible(true)
-        } else {
+        } else if (!showVisualizer) {
             // Silent seek: surface the transient skip indicator instead.
             skipSeekFeedback = SkipSeekFeedback(
                 deltaSeconds = (deltaMs / 1000).toInt(),
@@ -781,7 +815,7 @@ fun TvPlayerScreen(
             performRelativeSeek(
                 deltaMs = if (direction < 0) -SKIP_BACK_MS else SKIP_FORWARD_MS,
                 snapshot = snapshot,
-                revealControls = true,
+                revealControls = false,
                 captureQuickSkipBurst = true,
             )
         }
@@ -1137,9 +1171,9 @@ fun TvPlayerScreen(
                     true
                 }
                 TvPlayerRemoteKeyAction.SkipBack ->
-                    performRelativeSeek(-SKIP_BACK_MS, latestRoomSnapshot, revealControls = true)
+                    performRelativeSeek(-SKIP_BACK_MS, latestRoomSnapshot, revealControls = false)
                 TvPlayerRemoteKeyAction.SkipForward ->
-                    performRelativeSeek(SKIP_FORWARD_MS, latestRoomSnapshot, revealControls = true)
+                    performRelativeSeek(SKIP_FORWARD_MS, latestRoomSnapshot, revealControls = false)
                 TvPlayerRemoteKeyAction.OpenHud -> {
                     requestedHudTab = HudTab.Info
                     viewModel.openHUD()
@@ -1150,6 +1184,13 @@ fun TvPlayerScreen(
                     if (
                         event.action == KeyEvent.ACTION_DOWN &&
                         event.keyCode != KeyEvent.KEYCODE_BACK &&
+                        // Left/Right quick-skips are classified and consumed
+                        // above (the hidden-controls and quick-skip-burst
+                        // blocks) before `action` is ever used, so this is
+                        // unreachable for them today — kept explicit so a
+                        // seek never falls through to revealing controls
+                        // here if that ordering ever changes.
+                        horizontalDirection == 0 &&
                         !playerState.showControls
                     ) {
                         viewModel.setControlsVisible(true)
@@ -2003,6 +2044,9 @@ fun TvPlayerScreen(
                                     -SKIP_BACK_MS,
                                     roomSnapshot,
                                     revealControls = true,
+                                    // Scrubber idle-tap and transport-button
+                                    // skip: focus already shows this control.
+                                    showVisualizer = false,
                                 )
                             }
                         },
@@ -2012,6 +2056,7 @@ fun TvPlayerScreen(
                                     SKIP_FORWARD_MS,
                                     roomSnapshot,
                                     revealControls = true,
+                                    showVisualizer = false,
                                 )
                             }
                         },
@@ -2215,6 +2260,16 @@ fun TvPlayerScreen(
                     ) {
                         TvSkipSeekIndicator(feedback = skipSeekFeedback)
                     }
+                }
+
+                // Side chevron ripple, D-pad quick-skip only (see
+                // performRelativeSeek's showVisualizer). Not gated on
+                // showControls/hudOpen like the pill above: the quick-skip
+                // path never reveals controls (revealControls = false), so
+                // there's no overlay state for this purely cue-driven visual
+                // to race against.
+                if (!isInPictureInPictureMode) {
+                    TvSeekVisualizer(cue = seekVisualizerCue)
                 }
 
                 if (!isInPictureInPictureMode && showQuickSubtitlePicker) {
