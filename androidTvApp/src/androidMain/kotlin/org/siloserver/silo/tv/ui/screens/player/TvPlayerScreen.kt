@@ -2029,6 +2029,9 @@ fun TvPlayerScreen(
                         bufferedAheadSec = bufferedAheadSec,
                         chapters = state.chapters,
                         introRange = state.intro,
+                        creditsRange = state.credits,
+                        recapRange = state.recap,
+                        previewRange = state.preview,
                         isBuffering = state.isBuffering,
                         sleepTimerState = sleepTimerState,
                         // In a room, skip/scrub/seek are routed through the
@@ -2378,6 +2381,9 @@ private fun TvPlayerIdleOverlay(
     bufferedAheadSec: Double,
     chapters: List<org.siloserver.silo.model.catalog.VersionChapter>,
     introRange: org.siloserver.silo.model.catalog.TimeRange?,
+    creditsRange: org.siloserver.silo.model.catalog.TimeRange?,
+    recapRange: org.siloserver.silo.model.catalog.TimeRange?,
+    previewRange: org.siloserver.silo.model.catalog.TimeRange?,
     isBuffering: Boolean,
     sleepTimerState: SleepTimerState,
     onPlayPause: () -> Unit,
@@ -2519,6 +2525,15 @@ private fun TvPlayerIdleOverlay(
                     )
                 },
                 introRangeSec = introRange
+                    ?.takeIf { it.end > it.start }
+                    ?.let { it.start..it.end },
+                creditsRangeSec = creditsRange
+                    ?.takeIf { it.end > it.start }
+                    ?.let { it.start..it.end },
+                recapRangeSec = recapRange
+                    ?.takeIf { it.end > it.start }
+                    ?.let { it.start..it.end },
+                previewRangeSec = previewRange
                     ?.takeIf { it.end > it.start }
                     ?.let { it.start..it.end },
                 cancelOnBlur = false,
