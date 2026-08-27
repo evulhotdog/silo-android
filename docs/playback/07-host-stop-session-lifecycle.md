@@ -54,6 +54,17 @@ purposes while keeping the local screen intact:
   (park/renew/refusal/consumption cases).
 - Wiring proof: `TvPlayerHostStopSourceTest`.
 
+## Lost-stop self-heal
+
+The park's DELETE races the screen-off: Shield doze can kill the in-flight
+request after `onStop`, which resurrects a ghost row on the admin surface
+(two instances of the same episode; the zombie sits at its last session
+position because no reporter tick ever fired for it). Unconfirmed park stops
+are therefore queued in `pendingHostStopResends` and re-sent — fire-and-forget,
+idempotent server-side — on the next wake renewal and on every successful
+adoption. A 404 on resend settles the entry; a network failure keeps it queued
+for the next trigger.
+
 ## Known edge
 
 Waking from scrub/skip input re-plans at the requested target rather than the

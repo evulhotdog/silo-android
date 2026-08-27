@@ -978,6 +978,73 @@ class PlaybackSessionLifecycleTest {
         // Park-stop plus teardown-stop.
         assertEquals(2, sessionMgr.stopCallCount)
     }
+
+    @Test
+    fun `an unconfirmed park stop is queued and resent on the next liveness`() = runTest {
+        val sessionMgr = FakeSessionManager().apply {
+            // First stop (at park time) is lost to the screen-off race; the
+            // resend reaches a live server.
+            stopResults = ArrayDeque(listOf(
+                ApiResult.NetworkError(RuntimeException("asleep")),
+                ApiResult.Success(Unit),
+            ))
+        }
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-ghost"))
+        lifecycle.suspendSessionForHostStop("sess-ghost", positionSeconds = 5.0, durationSeconds = 30.0)
+
+        assertEquals(listOf("sess-ghost"), lifecycle.pendingHostStopResendIdsForTest().toList())
+
+        lifecycle.resendPendingHostStops()
+        runCurrent()
+        advanceUntilIdle()
+        assertTrue(lifecycle.pendingHostStopResendIdsForTest().isEmpty())
+        assertEquals(2, sessionMgr.stopCallCount)
+
+        // Settled: later liveness triggers are no-ops.
+        lifecycle.resendPendingHostStops()
+        runCurrent()
+        advanceUntilIdle()
+        assertEquals(2, sessionMgr.stopCallCount)
+    }
+
+    @Test
+    fun `a 404 on resend settles the queued stop`() = runTest {
+        val sessionMgr = FakeSessionManager().apply {
+            stopResults = ArrayDeque(listOf(
+                ApiResult.NetworkError(RuntimeException("asleep")),
+                ApiResult.Error(code = 404, error = "playback_session_not_found", message = "Playback session not found"),
+            ))
+        }
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-ghost"))
+        lifecycle.suspendSessionForHostStop("sess-ghost", positionSeconds = 5.0, durationSeconds = 30.0)
+
+        lifecycle.resendPendingHostStops()
+        runCurrent()
+        advanceUntilIdle()
+        assertTrue(lifecycle.pendingHostStopResendIdsForTest().isEmpty())
+        assertEquals(2, sessionMgr.stopCallCount)
+    }
+
+    @Test
+    fun `a network failure on resend keeps the stop queued`() = runTest {
+        val sessionMgr = FakeSessionManager().apply {
+            stopResults = ArrayDeque(listOf(
+                ApiResult.NetworkError(RuntimeException("asleep")),
+                ApiResult.NetworkError(RuntimeException("still asleep")),
+            ))
+        }
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-ghost"))
+        lifecycle.suspendSessionForHostStop("sess-ghost", positionSeconds = 5.0, durationSeconds = 30.0)
+
+        lifecycle.resendPendingHostStops()
+        runCurrent()
+        advanceUntilIdle()
+        assertEquals(listOf("sess-ghost"), lifecycle.pendingHostStopResendIdsForTest().toList())
+        assertEquals(2, sessionMgr.stopCallCount)
+    }
     // ------------------------------------------------------------------------
     // Test infrastructure
     // ------------------------------------------------------------------------
@@ -1049,6 +1116,7 @@ private open class FakeSessionManager : PlaybackSessionManager(
     var progressResults: ArrayDeque<ApiResult<Unit>>? = null
 
     var stopResult: ApiResult<Unit> = ApiResult.Success(Unit)
+    var stopResults: ArrayDeque<ApiResult<Unit>>? = null
 
     var progressCallCount = 0
     var stopCallCount = 0
@@ -1070,7 +1138,7 @@ private open class FakeSessionManager : PlaybackSessionManager(
     override suspend fun stopSession(sessionId: String): ApiResult<Unit> {
         stopCallCount++
         lastStoppedSessionId = sessionId
-        return stopResult
+        return stopResults?.takeIf { it.isNotEmpty() }?.removeFirst() ?: stopResult
     }
 }
 

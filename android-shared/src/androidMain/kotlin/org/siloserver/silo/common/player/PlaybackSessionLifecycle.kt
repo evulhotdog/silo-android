@@ -305,6 +305,10 @@ class PlaybackSessionLifecycle(
         )
         if (!adopted) {
             sessionManager.stopSession(session.sessionId)
+        } else {
+            // Fresh server-side liveness is the reliable moment to retry any
+            // park stop the screen-off race dropped.
+            resendPendingHostStops()
         }
         adopted
     } catch (cancellation: CancellationException) {
@@ -727,11 +731,21 @@ class PlaybackSessionLifecycle(
             reporterJob?.cancel()
             reporterJob = null
             when (val r = sessionManager.stopSession(owned)) {
-                is ApiResult.Error ->
+                is ApiResult.Error -> {
                     Log.w(TAG, "host-stop stopSession($owned) error: ${r.code} ${r.message}")
-                is ApiResult.NetworkError ->
+                    // 404 means the server already lost this session —
+                    // nothing left to stop, so no resend queue entry.
+                    if (r.code != 404) pendingHostStopResends.add(owned)
+                }
+                is ApiResult.NetworkError -> {
+                    // The screen-off race: Shield doze can kill the in-flight
+                    // DELETE before it reaches the server, which resurrects
+                    // the "two instances" ghost on the admin surface. Queue
+                    // for resend on the next wake/adoption liveness.
                     Log.w(TAG, "host-stop stopSession network error: ${r.exception}")
-                else -> {}
+                    pendingHostStopResends.add(owned)
+                }
+                else -> pendingHostStopResends.remove(owned)
             }
             parkedPlayback = ParkedPlayback(
                 sessionId = owned,
@@ -741,6 +755,47 @@ class PlaybackSessionLifecycle(
             _notice.value = null
             _state.value = SessionState.Suspended(owned)
             DiagnosticsPlaybackLogger.sessionEvent("session parked for host stop id=$owned")
+        }
+    }
+
+    /**
+     * Park stops the server never confirmed. Retried opportunistically
+     ([resendPendingHostStops]) because the original DELETE can be lost to
+     the screen-off race; a 404 on resend settles the entry (nothing left
+     to stop), a fresh success clears it, anything else stays queued.
+     */
+    private val pendingHostStopResends: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    internal fun pendingHostStopResendIdsForTest(): Set<String> =
+        pendingHostStopResends.toSet()
+
+    /**
+     * Fire-and-forget resend of every unconfirmed park stop. Idempotent on
+     * the server (DELETE of a stopped/unknown session is a quiet 404), so
+     * over-sending is harmless; under-sending is the ghost.
+     */
+    fun resendPendingHostStops() {
+        val ids = pendingHostStopResends.toList()
+        if (ids.isEmpty()) return
+        // Plain scope launch: NonCancellable children never run under the
+        // virtual-time scheduler (same lesson as the renewal emission), and
+        // this singleton scope already outlives every screen — the same
+        // guarantee level as the reporter and recovery jobs.
+        scope.launch {
+            for (id in ids) {
+                when (val r = sessionManager.stopSession(id)) {
+                    is ApiResult.NetworkError -> Unit // keep queued
+                    is ApiResult.Error -> {
+                        if (r.code == 404) {
+                            pendingHostStopResends.remove(id)
+                            Log.i(TAG, "resend stop for $id settled: server has no such session")
+                        }
+                        // Other errors: keep queued for the next trigger.
+                    }
+                    else -> pendingHostStopResends.remove(id)
+                }
+            }
         }
     }
 
@@ -762,6 +817,10 @@ class PlaybackSessionLifecycle(
     fun renewSuspendedSession(): Boolean {
         val parked = parkedPlayback ?: return false
         val params = parked.startParams ?: return false
+        // The device just came back; if the original park DELETE was lost to
+        // the screen-off race, this is the moment it can actually reach the
+        // server. Fire-and-forget, independent of the renewal below.
+        resendPendingHostStops()
         // Clear first: admits the resulting adoption past the parked-gate and
         // makes a second press a no-op while the wake is in flight.
         parkedPlayback = null
