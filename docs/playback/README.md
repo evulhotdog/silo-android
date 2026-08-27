@@ -38,6 +38,7 @@ and [migration guide](https://developer.android.com/media/media3/exoplayer/migra
 | [Intro skip](intro-skip.md) | Where the never/ask/always prompt lives, and the rules the server spec pins. |
 | [Shield 1080p capability audit](05-shield-1080p-playback-capability-audit.md) | Live protocol-v3 route matrix, catalog coverage, current direct-play gaps, and prioritized causes. |
 | [Device-correction evidence and design](06-device-quirk-evidence-and-design.md) | Current Jellyfin Android TV, Jellyfin Android, Wholphin, Plezy, Android platform, and issue evidence for the server/client quirk layer. |
+| [Host-stop session lifecycle](07-host-stop-session-lifecycle.md) | Android TV power-off parking: server-session stop, wake re-plan on transport intent, PiP and Watch Together exemptions. |
 
 Requirements are defined once in their owning document. Other documents link to
 that section instead of restating it; this prevents future agents from treating

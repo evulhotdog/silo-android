@@ -18,6 +18,7 @@ import org.siloserver.silo.common.player.PlaybackCapabilityDetector
 import org.siloserver.silo.common.player.PlaybackSessionLifecycle
 import org.siloserver.silo.common.player.PlaybackSessionManager
 import org.siloserver.silo.common.player.PlaybackTeardownGate
+import org.siloserver.silo.common.player.ParkedPlayback
 import org.siloserver.silo.common.player.video.MountedAudioTrack
 import org.siloserver.silo.common.player.video.AudioReconcileAction
 import org.siloserver.silo.common.player.video.DesiredAudio
@@ -1461,13 +1462,25 @@ class TvPlayerViewModel(
                     state.sessionId == renewal.staleSessionId &&
                     renewal.startParams.contentId == contentId
                 ) {
+                    val wakeOverride = pendingWakeStartOverride
+                    pendingWakeStartOverride = null
+                    wakeFromHostStopInFlight = false
                     loadContent(
-                        startPositionOverride = renewal.positionSeconds,
+                        startPositionOverride = wakeOverride ?: renewal.positionSeconds,
                         preferredFileIdOverride = renewal.startParams.fileId,
                         recoveryStartParams = renewal.startParams,
                         suppressResumeRewind = true,
                     )
                 }
+            }
+        }
+        // A host-stop wake re-plan is armed before its adoption lands; if it
+        // dies instead (server unreachable), a wedged flag must not eat every
+        // later transport press. Any change of the presented session id —
+        // successful replacement included — disarms it.
+        viewModelScope.launch {
+            _uiState.map { it.sessionId }.distinctUntilChanged().collect {
+                wakeFromHostStopInFlight = false
             }
         }
         viewModelScope.launch {
@@ -3005,8 +3018,13 @@ class TvPlayerViewModel(
         _uiState.update { it.copy(isBuffering = isBuffering) }
     }
 
-    /** Toggle user-intent pause state. Screen mirrors this to player.play/pause. */
+    /**
+     * Toggle user-intent pause state. Screen mirrors this to player.play/pause.
+     * Transitioning out of pause against a host-stop park wakes the session
+     * instead of un-pausing into a dead stream (see [beginWakeFromHostStop]).
+     */
     fun onPlayPause() {
+        if (_uiState.value.isPaused && beginWakeFromHostStop(startOverrideSeconds = null)) return
         _uiState.update { it.copy(isPaused = !it.isPaused) }
     }
 
@@ -3017,6 +3035,7 @@ class TvPlayerViewModel(
      * `state.isPaused` mirror drives `mediaController.playWhenReady`.
      */
     fun setPaused(paused: Boolean) {
+        if (!paused && beginWakeFromHostStop(startOverrideSeconds = null)) return
         _uiState.update { if (it.isPaused == paused) it else it.copy(isPaused = paused) }
     }
 
@@ -3030,6 +3049,10 @@ class TvPlayerViewModel(
      * `PlayerViewModel.seekImmediate` contract.
      */
     fun seekImmediate(positionSec: Double) {
+        // A deliberate scrub against a parked (dead) session is as much of a
+        // wake-up intent as Play: re-plan and let the load land on the
+        // requested position rather than silently scrubbing a corpse stream.
+        if (beginWakeFromHostStop(startOverrideSeconds = positionSec)) return
         cancelPendingQuickSkip()
         beginAndExecuteSeek(positionSec)
     }
@@ -3049,6 +3072,15 @@ class TvPlayerViewModel(
     /** Coalesces rapid remote/button skips into one route-aware seek. */
     fun onSkipBy(deltaSeconds: Double): Double {
         val state = _uiState.value
+        if (
+            quickSkipAccumulator.pending == null &&
+            beginWakeFromHostStop(
+                startOverrideSeconds = (state.position + deltaSeconds)
+                    .coerceAtLeast(0.0),
+            )
+        ) {
+            return state.position.coerceAtLeast(0.0)
+        }
         val nowMs = SystemClock.elapsedRealtime()
         if (quickSkipAccumulator.pending == null) {
             quickSkipOriginMs = (state.position * 1_000.0).toLong().coerceAtLeast(0L)
@@ -5052,6 +5084,104 @@ class TvPlayerViewModel(
 
     fun onExit() {
         stopSessionForExitAsync()
+    }
+
+    // ---- Host-stop suspension (TV power-off / remote sleep) ------------------
+
+    /** True between arming a wake re-plan and its load landing or dying. */
+    private var wakeFromHostStopInFlight = false
+
+    /** Scrub/skip target captured by the waking input; applied by the renewal collector. */
+    private var pendingWakeStartOverride: Double? = null
+
+    /**
+     * The host-stop park belonging to what this screen still believes it is
+     * presenting. A mismatched or absent park means ordinary playback — fall
+     * through to the normal path untouched.
+     */
+    private fun parkedHostStopForCurrentSession(): Boolean =
+        sessionLifecycle.suspendedPlayback?.let { parked ->
+            parked.sessionId == (lastAdoptedSessionId ?: _uiState.value.sessionId)
+        } ?: false
+
+    /**
+     * Intercepts transport intent aimed at a parked session. Returns true
+     * when the caller must NOT run its normal path: the parked stream is
+     * already stopped server-side, so un-pausing/seeking it locally would
+     * just stall. Instead the existing mid-play 404-recovery machinery is
+     * driven ([sessionLifecycle.renewSuspendedSession] -> missing-session
+     * event -> [loadContent] re-plan), which publishes Ready with
+     * `isPaused = false` — i.e. pressing Play after power-on resumes the
+     * film at where it stopped, invisibly, under a fresh server session.
+     *
+     * Caller guarantees solo playback: rooms never park (the screen skips
+     * the stop call when bound to one), so no room reconciliation here.
+     */
+    private fun beginWakeFromHostStop(startOverrideSeconds: Double?): Boolean {
+        if (wakeFromHostStopInFlight) {
+            if (startOverrideSeconds != null) pendingWakeStartOverride = startOverrideSeconds
+            return true
+        }
+        if (!parkedHostStopForCurrentSession()) return false
+        pendingWakeStartOverride = startOverrideSeconds
+        wakeFromHostStopInFlight = true
+        sessionLifecycle.renewSuspendedSession()
+        return true
+    }
+
+    /**
+     * The Activity stopped without a user exit (Android TV sends onStop when
+     * the device is powered off by remote; the process keeps running behind
+     * the dark panel). Treat that as an implicit end-of-viewing for SERVER
+     * purposes: sample the final position exactly like the Back path, write
+     * durable resume, then park the session — final progress flush plus an
+     * explicit stop request — so the admin "now playing" surface drops the
+     * entry immediately instead of it lingering paused forever off our 10s
+     * heartbeat. Local player/UI are left intact; waking presses Play via
+     * [beginWakeFromHostStop].
+     *
+     * Solo-playback only: callers skip this while a Watch Together room is
+     * bound (room liveness is its own contract).
+     */
+    fun onHostActivityStopped(positionMs: Long?, durationMs: Long?) {
+        val sid = exitSessionId ?: return
+        if (sessionLifecycle.suspendedPlayback?.sessionId == sid) return
+        _uiState.update { current ->
+            val snapshot = resolveTvPlaybackExitSnapshot(
+                currentPositionSeconds = current.position,
+                currentDurationSeconds = current.duration,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                timeline = current.playbackPlan?.timeline,
+                serverDurationSeconds = current.serverDuration,
+                allowPlayerDuration = current.playbackPlan == null,
+            )
+            current.copy(
+                position = snapshot.positionSeconds,
+                duration = snapshot.durationSeconds,
+            )
+        }
+        val state = _uiState.value
+        val fileId = state.selectedFileId ?: state.mediaFileId
+        val scope = finalPositionScope
+        if (scope != null && contentId.isNotBlank() && fileId != null) {
+            finalPlaybackPositionWriter.submit(
+                FinalPlaybackPosition(
+                    scope = scope,
+                    contentId = contentId,
+                    fileId = fileId,
+                    positionSeconds = state.position,
+                    durationSeconds = state.duration.takeIf { it > 0.0 },
+                ),
+            )
+        }
+        viewModelScope.launch {
+            sessionLifecycle.suspendSessionForHostStop(
+                expectedSessionId = sid,
+                positionSeconds = state.position,
+                durationSeconds = state.duration,
+            )
+        }
     }
 
     /**

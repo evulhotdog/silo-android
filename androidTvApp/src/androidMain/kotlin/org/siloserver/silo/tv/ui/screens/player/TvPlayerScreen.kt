@@ -1372,13 +1372,27 @@ fun TvPlayerScreen(
                 Lifecycle.Event.ON_PAUSE,
                 Lifecycle.Event.ON_STOP -> if (!isInPictureInPictureMode) {
                     mediaController?.let { controller ->
-                        if (controller.playWhenReady) {
-                            if (
-                                playWhenReadyReconciliationGate
-                                    .requestProgrammaticChange(false)
-                            ) {
-                                controller.pause()
-                            }
+                        if (
+                            controller.playWhenReady &&
+                            playWhenReadyReconciliationGate
+                                .requestProgrammaticChange(false)
+                        ) {
+                            controller.pause()
+                        }
+                        if (event == Lifecycle.Event.ON_STOP && roomController == null) {
+                            // Powering off / remote-sleep arrives as onStop
+                            // while the process keeps living behind the black
+                            // panel. Solo playback only — a bound Watch
+                            // Together room keeps its own liveness contract.
+                            // Park the server session (final flush + explicit
+                            // stop) so "now playing" drops it at once instead
+                            // of our heartbeat advertising a paused session
+                            // forever; pressing Play after wake re-plans
+                            // invisibly (see TvPlayerViewModel).
+                            viewModel.onHostActivityStopped(
+                                positionMs = controller.currentPosition,
+                                durationMs = controller.duration.takeIf { it > 0 },
+                            )
                         }
                     }
                 }

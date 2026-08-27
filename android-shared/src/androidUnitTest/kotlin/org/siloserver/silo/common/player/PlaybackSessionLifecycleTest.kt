@@ -27,6 +27,7 @@ import kotlinx.coroutines.yield
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -863,6 +864,120 @@ class PlaybackSessionLifecycleTest {
         lifecycle.acquireOwnershipEpoch()
     }
 
+    @Test
+    fun `host stop parks the session, stops it server-side, and silences the reporter`() = runTest {
+        val sessionMgr = FakeSessionManager()
+        val personalRepo = RecordingPersonalDataRepository()
+        val lifecycle = newLifecycle(sessionMgr, personalRepo = personalRepo, scope = backgroundScope)
+
+        lifecycle.adoptActiveSession(defaultStartParams(startPosition = 12.0), makeSession("sess-park"))
+        lifecycle.reportOwnedPosition(positionSec = 77.0, durationSec = 100.0, isPaused = false)
+        advanceTimeBy(PlaybackSessionLifecycle.PROGRESS_REPORT_INTERVAL_MS + 100)
+        assertEquals(1, sessionMgr.progressCallCount)
+
+        lifecycle.suspendSessionForHostStop(
+            expectedSessionId = "sess-park",
+            positionSeconds = 88.5,
+            durationSeconds = 100.0,
+        )
+
+        val parked = assertNotNull(lifecycle.suspendedPlayback)
+        assertEquals("sess-park", parked.sessionId)
+        assertEquals(88.5, parked.positionSeconds)
+        assertTrue(lifecycle.state.value is SessionState.Suspended)
+
+        // The park flushed a durable snapshot at the caller-sampled position…
+        val lastSync = assertNotNull(personalRepo.syncCalls.lastOrNull())
+        assertEquals(1, lastSync.size)
+        assertEquals(88.5, lastSync[0].position)
+        assertTrue(lastSync[0].forceOverwrite)
+
+        // …requested the explicit server stop exactly once…
+        assertEquals(1, sessionMgr.stopCallCount)
+        assertEquals("sess-park", sessionMgr.lastStoppedSessionId)
+
+        // …and parked ticks never fire another progress report afterwards.
+        advanceTimeBy(3 * PlaybackSessionLifecycle.PROGRESS_REPORT_INTERVAL_MS)
+        assertEquals(1, sessionMgr.progressCallCount)
+    }
+
+    @Test
+    fun `renewing a parked session emits its renewal once and admits adoption again`() = runTest {
+        val sessionMgr = FakeSessionManager()
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+
+        // Subscribe FIRST, exactly like the 404-recovery tests: prime before
+        // any playback machinery exists that can enqueue competing work.
+        val events = mutableListOf<MissingSessionRenewal>()
+        backgroundScope.launch { lifecycle.missingSessionEvents.collect { events += it } }
+        advanceUntilIdle()
+
+        lifecycle.adoptActiveSession(
+            params = defaultStartParams(startPosition = 12.0).copy(subtitleTrackIndex = 5),
+            session = makeSession("sess-park"),
+        )
+        lifecycle.suspendSessionForHostStop("sess-park", positionSeconds = 61.5, durationSeconds = 120.0)
+
+        assertTrue(lifecycle.renewSuspendedSession())
+        runCurrent()
+        advanceUntilIdle()
+        // A second press finds nothing left to renew.
+        assertFalse(lifecycle.renewSuspendedSession())
+        advanceUntilIdle()
+
+        assertEquals(1, events.size)
+        val renewal = events[0]
+        assertEquals("sess-park", renewal.staleSessionId)
+        assertEquals(61.5, renewal.positionSeconds)
+        assertEquals(5, renewal.startParams.subtitleTrackIndex)
+        assertNull(lifecycle.suspendedPlayback)
+
+        // With the park cleared, a fresh adoption is admitted again.
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-fresh"))
+        val active = lifecycle.state.value
+        assertTrue(active is SessionState.Active)
+        assertEquals("sess-fresh", (active as SessionState.Active).session.sessionId)
+    }
+
+    @Test
+    fun `a parked session refuses stray adoptions and stops the rejected candidate`() = runTest {
+        val sessionMgr = FakeSessionManager()
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+        val epoch = lifecycle.acquireOwnershipEpoch()
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-a"))
+
+        lifecycle.suspendSessionForHostStop(
+            expectedSessionId = "sess-a",
+            positionSeconds = 20.0,
+            durationSeconds = 50.0,
+        )
+        assertEquals(1, sessionMgr.stopCallCount)
+
+        val adopted = lifecycle.adoptActiveSessionIfCurrent(
+            params = defaultStartParams(),
+            session = makeSession("sess-b"),
+            expectedOwnershipEpoch = epoch,
+        )
+        assertFalse(adopted)
+        assertTrue(lifecycle.state.value is SessionState.Suspended)
+        // The epoch overload closes the rejected candidate itself.
+        assertEquals("sess-b", sessionMgr.lastStoppedSessionId)
+    }
+
+    @Test
+    fun `a full teardown consumes the park`() = runTest {
+        val sessionMgr = FakeSessionManager()
+        val lifecycle = newLifecycle(sessionMgr, scope = backgroundScope)
+        lifecycle.adoptActiveSession(defaultStartParams(), makeSession("sess-gone"))
+        lifecycle.suspendSessionForHostStop("sess-gone", positionSeconds = 9.0, durationSeconds = 30.0)
+
+        lifecycle.stop(expectedSessionId = "sess-gone")
+
+        assertEquals(SessionState.Idle, lifecycle.state.value)
+        assertNull(lifecycle.suspendedPlayback)
+        // Park-stop plus teardown-stop.
+        assertEquals(2, sessionMgr.stopCallCount)
+    }
     // ------------------------------------------------------------------------
     // Test infrastructure
     // ------------------------------------------------------------------------

@@ -105,6 +105,21 @@ class PlaybackSessionLifecycle(
     private val externalFinalizationLock = Any()
     private val pendingExternalFinalizations = mutableMapOf<String, Job>()
 
+    /**
+     * Session parked by [suspendSessionForHostStop] — the host lifecycle
+     * interrupted playback without an explicit user exit (TV powered off;
+     * device sleep follows Activity onStop on Android TV boxes).
+     *
+     * A parked session is DEAD server-side (stopped explicitly so the admin
+     * "now playing" list drops it immediately) but its owner is very much
+     * alive: params stay intact so pressing Play can re-plan invisibly
+     * through [renewSuspendedSessionAsync] instead of bouncing the viewer
+     * out to the detail screen. Non-null ALSO gates every adoption below so
+     * an in-flight start cannot resurrect capacity behind a sleeping screen.
+     */
+    @Volatile
+    private var parkedPlayback: ParkedPlayback? = null
+
     private data class ActiveSessionSnapshot(
         val state: SessionState,
         /**
@@ -213,6 +228,12 @@ class PlaybackSessionLifecycle(
         val diagnosticsRecording = playbackSessions.recording()
         return mutex.withLock {
             if (!isCurrent()) return@withLock false
+            // A host-stop park outranks any start still in flight: behind a
+            // sleeping screen there is nobody to present the winning plan to,
+            // and letting it adopt would resurrect server-side capacity the
+            // park just released. renewSuspendedSession() clears the park first, so the
+            // wake re-plan itself is admitted.
+            if (parkedPlayback != null) return@withLock false
             val predecessor = if (deferPublication) {
                 pendingActiveSessionPublication?.predecessor
                     ?: captureActiveSessionSnapshot()
@@ -562,7 +583,8 @@ class PlaybackSessionLifecycle(
 
             if (sessionId != null && stopActiveSessionOnStop) {
                 when (val r = sessionManager.stopSession(sessionId)) {
-                    is ApiResult.Error -> Log.w(TAG, "stopSession error: ${r.code} ${r.message}")
+                    is ApiResult.Error ->
+                        Log.w(TAG, "stopSession($sessionId) error: ${r.code} ${r.message}")
                     is ApiResult.NetworkError ->
                         Log.w(TAG, "stopSession network error: ${r.exception}")
                     else -> {}
@@ -577,6 +599,8 @@ class PlaybackSessionLifecycle(
             flushProgressOnStop = true
             stopActiveSessionOnStop = true
             pendingActiveSessionPublication = null
+            // A real teardown consumes any park under the retired id.
+            parkedPlayback = null
             _notice.value = null
             lastAdoptedSessionId = null
             _state.value = SessionState.Idle
@@ -650,6 +674,119 @@ class PlaybackSessionLifecycle(
             }
         }
         job.start()
+    }
+
+    /**
+     * Parks host-owned playback because the Activity stopped without a user
+     * exit — Android TV delivers onStop when the device is powered off with
+     * the remote, and the process keeps living behind the black panel.
+     *
+     * Contrast with [stop]: this writes the final progress snapshot, cancels
+     * every reporting/recovery job, and explicitly stops the SERVER session
+     * (so the admin "now playing" surface drops it immediately instead of
+     * waiting out the 30-minute paused-grace reap), but deliberately KEEPS
+     * the adoption-time ownership context. The screen survives; pressing Play
+     * later calls [renewSuspendedSessionAsync], whose emitted renewal lets
+     * the owner re-plan invisibly at the parked position. While parked,
+     * every adoption path is refused (see the guard in
+     * [adoptActiveSessionIfCurrent]) so a start still in flight cannot
+     * resurrect capacity behind a dark screen.
+     */
+    suspend fun suspendSessionForHostStop(
+        expectedSessionId: String?,
+        positionSeconds: Double?,
+        durationSeconds: Double?,
+    ) {
+        mutex.withLock {
+            val owned =
+                (_state.value as? SessionState.Active)?.session?.sessionId
+                    ?: lastAdoptedSessionId
+            if (owned == null || _state.value is SessionState.Suspended) return
+            if (expectedSessionId != null && owned != expectedSessionId) return
+
+            // The caller samples the live transport clock at STOP time, which
+            // beats the reporter's cache (the controller pause may have raced
+            // the last tick). Then mark paused: nobody is watching.
+            positionSeconds?.takeIf { it.isFinite() && it >= 0 }?.let {
+                lastReportedPosition = it
+                // Same dual-write contract as reportPosition: session time
+                // and durable content time move together, or the parked
+                // snapshot below (which prefers persistence coordinates)
+                // wakes playback at a stale load position.
+                lastPersistencePosition = it
+            }
+            durationSeconds?.takeIf { it.isFinite() && it > 0 }?.let {
+                lastReportedDuration = it
+                lastPersistenceDuration = it
+            }
+            lastIsPaused = true
+            if (flushProgressOnStop) {
+                flushFinalProgress()
+            }
+            cancelRecoveryJobs()
+            reporterJob?.cancel()
+            reporterJob = null
+            when (val r = sessionManager.stopSession(owned)) {
+                is ApiResult.Error ->
+                    Log.w(TAG, "host-stop stopSession($owned) error: ${r.code} ${r.message}")
+                is ApiResult.NetworkError ->
+                    Log.w(TAG, "host-stop stopSession network error: ${r.exception}")
+                else -> {}
+            }
+            parkedPlayback = ParkedPlayback(
+                sessionId = owned,
+                positionSeconds = lastPersistencePosition ?: lastReportedPosition ?: 0.0,
+                startParams = lastStartParams,
+            )
+            _notice.value = null
+            _state.value = SessionState.Suspended(owned)
+            DiagnosticsPlaybackLogger.sessionEvent("session parked for host stop id=$owned")
+        }
+    }
+
+    /**
+     * Whether a host-stop park currently owns the session a screen believes
+     * it is presenting. Transport entry points consult this before touching
+     * the local player: the parked session's stream is already dead.
+     */
+    val suspendedPlayback: ParkedPlayback?
+        get() = parkedPlayback
+
+    /**
+     * Wakes a parked session: emits its renewal to the owner exactly like a
+     * mid-play 404 would, so the SAME recovery plumbing re-plans at the
+     * parked position. Fire-and-forget; the park is cleared synchronously
+     * first, which both prevents double-emission and admits the resulting
+     * adoption past the parked-gate.
+     */
+    fun renewSuspendedSession(): Boolean {
+        val parked = parkedPlayback ?: return false
+        val params = parked.startParams ?: return false
+        // Clear first: admits the resulting adoption past the parked-gate and
+        // makes a second press a no-op while the wake is in flight.
+        parkedPlayback = null
+        // Ownership context is intact (park preserved lastAdoptedSessionId /
+        // params), so a plain scheduled child carrying the renewal is enough
+        // — deliberately NOT handleSessionMissing: its LAZY recovery job was
+        // observed starved under cold scheduler drains, and the wake needs no
+        // debounce (park-clearing makes this single-shot) and no second
+        // durable flush (the park already flushed at stop time). Release the
+        // 404-debounce flag so later genuine misses can arm again.
+        if (recoveringFromMissingSession == parked.sessionId) {
+            recoveringFromMissingSession = null
+        }
+        scope.launch {
+            if (!ownsProgressReply(parked.sessionId)) return@launch
+            _missingSessionEvents.emit(
+                MissingSessionRenewal(
+                    staleSessionId = parked.sessionId,
+                    positionSeconds = parked.positionSeconds,
+                    startParams = params,
+                ),
+            )
+        }
+        DiagnosticsPlaybackLogger.sessionEvent("parked session renewal requested")
+        return true
     }
 
     /**
@@ -975,6 +1112,13 @@ sealed interface SessionState {
         val tone: NoticeTone = NoticeTone.Warning,
     ) : SessionState
     data class Failed(val message: String) : SessionState
+
+    /**
+     * Host-lifecycle suspension (Android TV power-off/sleep): the server
+     * session was stopped explicitly but the owner survived and is expected
+     * to renew on demand. See [ParkedPlayback].
+     */
+    data class Suspended(val sessionId: String) : SessionState
 }
 
 /** Severity / styling tone for a [PlayerNotice]. */
@@ -1002,6 +1146,21 @@ data class MissingSessionRenewal(
     val staleSessionId: String,
     val positionSeconds: Double,
     val startParams: StartParams,
+)
+
+/**
+ * A playback session parked by a host-lifecycle interruption (TV powered
+ * off, remote sleep) rather than a user exit. Carries exactly what the
+ * surviving screen needs to re-plan invisibly on demand: the now-dead
+ * session id for ownership checks, where playback stopped, and the
+ * adoption-time intent snapshot — [StartParams], never live player tracks,
+ * for the same reason [MissingSessionRenewal] insists on adoption-time
+ * evidence.
+ */
+data class ParkedPlayback(
+    val sessionId: String,
+    val positionSeconds: Double,
+    val startParams: StartParams?,
 )
 
 /**
