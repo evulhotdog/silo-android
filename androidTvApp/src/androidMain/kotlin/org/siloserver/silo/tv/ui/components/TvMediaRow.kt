@@ -29,9 +29,13 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import org.siloserver.silo.model.section.SectionItem
 import org.siloserver.silo.overlays.OverlayData
 import org.siloserver.silo.overlays.OverlayDataExtractor
+import org.siloserver.silo.tv.ui.focus.TvFocusLog
 import org.siloserver.silo.tv.ui.theme.TvRailScrollBehavior
 import org.siloserver.silo.tv.ui.theme.tvRailPinOnFocus
 import org.siloserver.silo.tv.ui.theme.Spacing
+import org.siloserver.silo.common.diagnostics.DiagnosticsKeyAnomalyLogger
+import org.siloserver.silo.common.diagnostics.DiagnosticsKeyCollection
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSnapshot
 
 /** Visual style of cards inside a [TvMediaRow]. */
 enum class TvRowStyle { Poster, Backdrop }
@@ -118,6 +122,15 @@ fun TvMediaRow(
     onRowFocusChanged: ((Boolean) -> Unit)? = null,
     cardActions: (SectionItem) -> TvMediaCardActions = { TvMediaCardActions() },
 ) {
+    val diagnosticsKeySnapshot = remember(items) {
+        DiagnosticsListSnapshot.fromKeys(items.map { it.contentId })
+    }
+    LaunchedEffect(diagnosticsKeySnapshot) {
+        DiagnosticsKeyAnomalyLogger.snapshot(
+            DiagnosticsKeyCollection.TV_MEDIA_ROW,
+            diagnosticsKeySnapshot,
+        )
+    }
     if (items.isEmpty()) return
     val rowState = rememberLazyListState()
     val rowItems = remember(items, showProgress, style, cardLayout) {
@@ -160,12 +173,22 @@ fun TvMediaRow(
     }
 
     LaunchedEffect(restoreFocusRequest, resolvedRestoreFocusIndex, restoreFocusContentId) {
-        prepareTvMediaRowFocusRestore(
+        val scrolled = prepareTvMediaRowFocusRestore(
             requestId = restoreFocusRequest,
             restoreFocusIndex = resolvedRestoreFocusIndex,
             itemCount = rowItems.size,
             scrollToItem = rowState::scrollToItem,
         )
+        // A restore scroll that fires while no caller-driven ladder could be
+        // running is the signature of the rail snapping instead of gliding
+        // (the instant jump cancels the pin's animation) — surface it in the
+        // debug focus log rather than leaving it invisible on screen.
+        if (restoreFocusRequest > 0 || scrolled) {
+            TvFocusLog.d {
+                "rail restore scroll request=$restoreFocusRequest " +
+                    "index=$resolvedRestoreFocusIndex scrolled=$scrolled"
+            }
+        }
     }
 
     LaunchedEffect(firstItemFocusRequest) {
@@ -353,7 +376,7 @@ fun TvMediaRow(
                             userState = item.userState,
                             progress = rowItem.progress,
                             mediaType = item.type,
-                            width = posterWidth ?: TvCardWidth,
+                            width = posterWidth ?: tvCardWidth(),
                             onClick = { onItemClick(item.contentId) },
                             focusRequester = itemFocusRequester,
                             cardModifier = appliedCardModifier,

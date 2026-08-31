@@ -387,7 +387,7 @@ val androidTvModule = module {
     }
 
     // Content ViewModels
-    viewModel { HomeViewModel(get(), get(), get(), get(), getOrNull(), get()) }
+    viewModel { HomeViewModel(get(), get(), get(), get(), getOrNull(), get(), get()) }
     viewModel { org.siloserver.silo.tv.ui.screens.home.TvUpcomingViewModel(get()) }
     viewModel { RecommendationsViewModel(get()) }
     viewModel { RequestsViewModel(get()) }
@@ -520,6 +520,7 @@ val androidTvModule = module {
             playerSettingsStore = get(),
             libraryPlaybackPrefsStore = get(),
             overlayPrefsStore = get(),
+            cardPresentationStore = get(),
             legacyTvPrefsMigration = get(),
             profileSettings = get(),
             tvLibraryScopeStore = getOrNull(),
