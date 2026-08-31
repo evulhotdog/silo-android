@@ -11,6 +11,7 @@
 # Usage:
 #   bash scripts/build-push-shield-release.sh                 # debug build + install
 #   bash scripts/build-push-shield-release.sh -r              # release build + install
+#   bash scripts/build-push-shield-release.sh -d              # allow versionCode downgrade
 #   bash scripts/build-push-shield-release.sh --skip-build    # install existing APK
 #   bash scripts/build-push-shield-release.sh -r --skip-build # install existing release APK
 #   SHIELD_HOST=192.0.2.10 bash scripts/build-push-shield-release.sh
@@ -37,6 +38,7 @@ HOST=${SHIELD_HOST:-}
 PORT=${SHIELD_PORT:-5555}
 RELEASE=0
 SKIP_BUILD=0
+ALLOW_DOWNGRADE=0
 VARIANT="debug"
 APP_ID="org.siloserver.silo"
 
@@ -47,11 +49,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --host) HOST=${2:?"--host requires a value"}; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
+        -d|--allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
         -r|--release)
             RELEASE=1
             VARIANT="release"
             shift ;;
--h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) die "Unknown argument: $1" ;;
     esac
 done
@@ -99,8 +102,14 @@ fi
 adb devices | awk 'NR>1 {print $1}' | grep -Fxq "$SERIAL" \
     || die "Could not reach $SERIAL. Check the Shield is awake with network debugging on."
 
-log "Installing $APK"
-adb -s "$SERIAL" install -r "$APK"
+INSTALL_ARGS=(-r)
+if [[ "$ALLOW_DOWNGRADE" -eq 1 ]]; then
+    INSTALL_ARGS+=(-d)
+    log "Installing $APK (allow versionCode downgrade)"
+else
+    log "Installing $APK"
+fi
+adb -s "$SERIAL" install "${INSTALL_ARGS[@]}" "$APK"
 
 adb -s "$SERIAL" shell pm list packages | grep -Fq "$APP_ID" \
     || die "Install finished, but $APP_ID was not reported by pm list packages."
