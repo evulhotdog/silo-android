@@ -382,6 +382,12 @@ val androidModule = module {
             serverRegistry = get(),
         )
     }
+    single {
+        org.siloserver.silo.android.ui.screens.home.HomeSectionPreferencesStore(
+            context = get(),
+            serverRegistry = get(),
+        )
+    }
     viewModel { params ->
         BrowseViewModel(
             get(),
@@ -442,7 +448,7 @@ val androidModule = module {
     viewModel { SignupViewModel(get()) }
     viewModel { InviteClaimViewModel(get(), get()) }
     viewModel { OnboardingTourViewModel(get(), get(), get(), get(), get()) }
-    viewModel { ProfileSelectionViewModel(get()) }
+    viewModel { ProfileSelectionViewModel(get(), get()) }
     viewModel { CreateProfileViewModel(get()) }
     viewModel { EditProfileViewModel(get()) }
     viewModel { ServerListViewModel(get(), get()) }

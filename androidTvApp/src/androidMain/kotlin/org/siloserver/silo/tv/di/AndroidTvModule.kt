@@ -6,6 +6,7 @@ import org.siloserver.silo.network.ApiResult
 import org.siloserver.silo.repository.SettingsRepository
 import org.siloserver.silo.tv.BuildConfig
 import org.siloserver.silo.tv.data.preferences.LegacyTvPrefsMigration
+import org.siloserver.silo.tv.data.preferences.TvHomeSectionPreferences
 import org.siloserver.silo.tv.data.preferences.TvLibrarySelectionStore
 import org.siloserver.silo.common.network.AndroidDeviceMetadataProvider
 import org.siloserver.silo.common.network.SiloClientBuildIdentity
@@ -202,6 +203,7 @@ val androidTvModule = module {
             playerSettingsStore = get(),
             sessionLifecycle = get(),
             reachabilityMonitor = get(),
+            userItemStatePort = get(),
         )
     }
     factory {
@@ -261,6 +263,10 @@ val androidTvModule = module {
     single {
         org.siloserver.silo.tv.data.preferences.TvLibraryScopeStore(androidContext(), get())
     }
+
+    // tvOS-parity Home row visibility/order, local to this TV and partitioned
+    // by active server + profile.
+    single { TvHomeSectionPreferences(androidContext(), get()) }
 
     // One-shot legacy `tv_prefs` import (playback settings → server device
     // overrides; selected-library id → active profile's selection store).
@@ -364,7 +370,7 @@ val androidTvModule = module {
     viewModel { org.siloserver.silo.tv.ui.screens.auth.TvSetupViewModel(get()) }
     viewModel { org.siloserver.silo.tv.ui.screens.auth.TvSignupViewModel(get()) }
     viewModel { TvLoginViewModel(get(), get(), get()) }
-    viewModel { TvProfileSelectionViewModel(get()) }
+    viewModel { TvProfileSelectionViewModel(get(), get()) }
     viewModel { org.siloserver.silo.tv.ui.screens.profiles.TvCreateProfileViewModel(get()) }
     viewModel { params ->
         org.siloserver.silo.tv.ui.screens.profiles.TvEditProfileViewModel(
@@ -448,6 +454,7 @@ val androidTvModule = module {
             recommendationRepository = getOrNull(),
             tokenManager = get(),
             identityTransitions = get(),
+            capabilityDetector = get(),
         )
     }
     // Watch Together entry (create/join orchestration) — backs the entry +

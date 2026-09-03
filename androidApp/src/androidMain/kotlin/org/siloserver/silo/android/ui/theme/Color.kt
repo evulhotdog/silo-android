@@ -6,6 +6,14 @@ import androidx.compose.ui.graphics.Color
 // Pure-black backgrounds, EDEDED primary text, white-at-opacity for everything else.
 
 val SiloBackground = Color(0xFF000000)
+
+/**
+ * The signed-in page canvas. iOS paints `ContinuumPageBackdrop` (#111111) under
+ * every signed-in phone surface instead of pure black (silo-apple PR #222);
+ * `SiloBackground` stays black for the ink and player roles that mirror
+ * `continuumBackground`. Settings keeps `SiloSettingsBackground`.
+ */
+val SiloPageBackground = Color(0xFF111111)
 val SiloSurface = Color(0xFF0A0A0A)
 val SiloSurfaceVariant = Color(0xFF0E0F12)
 val SiloSurfaceElevated = Color(0xFF15171C)
@@ -17,6 +25,23 @@ val SiloDisabled = Color(0xFF4B5563)
 val SiloOutline = Color.White.copy(alpha = 0.12f)
 val SiloDivider = Color.White.copy(alpha = 0.12f)
 val SiloOverlay = Color.Black.copy(alpha = 0.60f)
+
+// Restrained Android substitute for iOS Liquid Glass. These shared washes keep
+// every migrated circle/capsule in one light material family without a live
+// blur. They remain inexpensive on
+// Android (no live backdrop blur), while allowing the title-derived surface
+// underneath to tint them instead of reading as flat white plastic.
+val SiloOpaqueControl = Color.White.copy(alpha = 0.58f)
+val SiloOpaqueControlSelected = Color.White.copy(alpha = 0.70f)
+val SiloOpaqueControlSelectionOverlay = Color.White.copy(alpha = 0.18f)
+// PR #212 PhoneLabeledAction values. These read as the same adaptive material
+// family as the Home tab bar over a dark detail surface without becoming the
+// pale, nearly solid circles shown in the Android comparison screenshot.
+val SiloDetailActionControl = Color.White.copy(alpha = 0.10f)
+val SiloDetailActionControlActive = Color.White.copy(alpha = 0.30f)
+val SiloOnOpaqueControl = Color(0xFF17171A)
+val SiloOnOpaqueControlMuted = Color(0xFF4F4F55)
+val SiloOpaqueControlBorder = Color.White.copy(alpha = 0.46f)
 
 // --- Grouped-surface palette (Silo web client parity) ---
 //
@@ -71,7 +96,7 @@ val SiloWhiteSoft = SiloOnSurface
 val SiloWhiteMuted = SiloSecondaryText
 val SiloBlack = SiloBackground
 
-val DarkBackground = SiloBackground
+val DarkBackground = SiloPageBackground
 val DarkSurface = SiloSurface
 val DarkSurfaceVariant = SiloSurfaceVariant
 val DarkSurfaceHigh = SiloSurfaceElevated

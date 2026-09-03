@@ -1,11 +1,13 @@
 package org.siloserver.silo.tv.ui.screens.player
 
 import android.util.Log
+import androidx.media3.common.util.UnstableApi
 import org.siloserver.silo.common.network.ServerReachabilityMonitor
 import org.siloserver.silo.common.player.PlaybackCapabilityDetector
 import org.siloserver.silo.common.player.PlaybackSessionLifecycle
 import org.siloserver.silo.common.player.PlaybackSessionManager
 import org.siloserver.silo.common.player.StartParams
+import org.siloserver.silo.common.player.TrackSelectionPresets
 import org.siloserver.silo.common.player.VideoSessionStartV3
 import org.siloserver.silo.common.player.video.VideoPlaybackStartRequest
 import org.siloserver.silo.common.player.video.VideoPlaybackStartResult
@@ -17,13 +19,16 @@ import org.siloserver.silo.common.player.video.ResolvedEpisodeSelection
 import org.siloserver.silo.common.player.video.resolveEpisodeSourceIntent
 import org.siloserver.silo.common.player.video.EpisodeAudioCandidate
 import org.siloserver.silo.common.player.video.EpisodeAudioIntent
+import org.siloserver.silo.common.player.video.EpisodeAudioMode
 import org.siloserver.silo.common.player.video.resolveEpisodeAudioIntent
 import org.siloserver.silo.common.player.video.resolveEpisodeSubtitleIntent
 import org.siloserver.silo.common.player.video.resolvedPlaybackDelivery
+import org.siloserver.silo.common.player.video.serverTerminalUserMessage
 import org.siloserver.silo.common.player.video.shouldReachServerForPlayback
 import org.siloserver.silo.common.settings.PlayerSettingsStore
 import org.siloserver.silo.common.settings.dolbyVisionPolicySnapshot
 import org.siloserver.silo.model.catalog.FileVersion
+import org.siloserver.silo.model.playback.ClientCodecCapabilities
 import org.siloserver.silo.model.playback.applyResumeRewind
 import org.siloserver.silo.model.playback.buildPlaybackSubtitleChoices
 import org.siloserver.silo.model.playback.enrichAuthoritativePlaybackSubtitleChoices
@@ -32,13 +37,16 @@ import org.siloserver.silo.model.playback.resolvePlaybackStartRequestPosition
 import org.siloserver.silo.model.playback.resolvePlaybackStartPosition
 import org.siloserver.silo.network.ApiResult
 import org.siloserver.silo.playback.orNullIfBlank
+import org.siloserver.silo.playback.resolveAudioTrackOrdinal
 import org.siloserver.silo.playback.selectPlaybackVersion
 import org.siloserver.silo.repository.CatalogRepository
 import org.siloserver.silo.repository.ProfileRepository
+import org.siloserver.silo.repository.port.UserItemStatePort
 import org.siloserver.silo.tv.BuildConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 
+@UnstableApi
 class TvVideoPlaybackStarter(
     private val catalogRepository: CatalogRepository,
     private val playbackSessionManager: PlaybackSessionManager,
@@ -47,6 +55,7 @@ class TvVideoPlaybackStarter(
     private val playerSettingsStore: PlayerSettingsStore,
     private val sessionLifecycle: PlaybackSessionLifecycle,
     private val reachabilityMonitor: ServerReachabilityMonitor,
+    private val userItemStatePort: UserItemStatePort,
 ) : VideoPlaybackStarter {
 
     override suspend fun start(request: VideoPlaybackStartRequest): VideoPlaybackStartResult {
@@ -106,8 +115,24 @@ class TvVideoPlaybackStarter(
                     "No active profile selected",
                     diagnosticsCode = PlaybackDiagnosticsCode.NO_ACTIVE_PROFILE,
                 )
-            val preferredAudioLanguage = playerSettingsStore.audioLanguageFlow
+            val configuredAudioLanguage = playerSettingsStore.audioLanguageFlow
                 .first().ifBlank { null }
+            val preferredAudioLanguage = configuredAudioLanguage
+                ?: activeProfile?.language.orNullIfBlank()
+            val carriedAudioIndex = resolvedEpisodeSelection.audioTrackIndex
+            val unresolvedCarriedChoice = request.episodeSelectionHandoff
+                ?.audio
+                ?.mode == EpisodeAudioMode.TRACK && carriedAudioIndex == null
+            val durableAudioFingerprint = if (
+                request.audioTrackIndex == null &&
+                carriedAudioIndex == null &&
+                !unresolvedCarriedChoice
+            ) {
+                userItemStatePort.localTrackSelection(request.contentId, version.fileId)
+                    ?.audioFingerprint
+            } else {
+                null
+            }
             val accessToken = playbackSessionManager.getAccessToken()
                 ?: return failure(
                     request.contentId,
@@ -125,6 +150,22 @@ class TvVideoPlaybackStarter(
                     dolbyVision = dolbyVision,
                     capabilities = capabilities,
                 )
+            val effectivePreferredAudioLanguage = TrackSelectionPresets.effectivePreferredAudioLanguage(
+                settingsLanguage = preferredAudioLanguage,
+                profileLanguage = activeProfile?.language,
+            )
+            // Explicit, carried, and durable choices win. Otherwise resolve the
+            // automatic language + quality policy against the detected device
+            // capabilities before asking the server for a plan.
+            val startAudioTrackIndex = resolveTvInitialAudioTrackIndex(
+                requestedAudioIndex = request.audioTrackIndex,
+                carriedAudioIndex = carriedAudioIndex,
+                unresolvedCarriedChoice = unresolvedCarriedChoice,
+                tracks = version.audioTracks.orEmpty(),
+                durableAudioFingerprint = durableAudioFingerprint,
+                preferredAudioLanguage = effectivePreferredAudioLanguage,
+                capabilities = capabilities,
+            )
             // Skip-back-on-resume — see MobileVideoPlaybackStarter for the rationale.
             // Suppressed for Start Over / retry (request flag) and Watch Together
             // (roomId); the one rewound value drives both the server seek and the
@@ -158,8 +199,7 @@ class TvVideoPlaybackStarter(
                     // the carry-over resolved a track and then threw it away,
                     // and a dubbed household was returned to the server default
                     // at every automatic transition.
-                    audioTrackIndex = request.audioTrackIndex
-                        ?: resolvedEpisodeSelection.audioTrackIndex,
+                    audioTrackIndex = startAudioTrackIndex,
                     subtitleTrackIndex = serverSubtitleTrackIndex,
                     qualityPreference = playbackQualityIntent,
                     startPosition = startRequestPosition,
@@ -188,7 +228,7 @@ class TvVideoPlaybackStarter(
                 is VideoSessionStartV3.Ready -> v3Start
                 is VideoSessionStartV3.Terminal -> return failure(
                     request.contentId,
-                    "Playback unavailable (${v3Start.reason}): ${v3Start.message}",
+                    serverTerminalUserMessage(v3Start.message),
                     diagnosticsCode = PlaybackDiagnosticsCode.serverTerminal(v3Start.reason),
                 )
                 VideoSessionStartV3.ServerUpgradeRequired -> return failure(
@@ -281,6 +321,7 @@ class TvVideoPlaybackStarter(
                 serverUrl = serverUrl,
                 accessToken = accessToken,
                 mediaFileId = effectiveFileId,
+                audioTrackIndex = resolved.audioTrackIndex,
                 // Protocol v3 source duration is authoritative. Unknown stays
                 // unknown; catalog/player runtimes must not fill this field.
                 durationSeconds = resolved.durationSeconds,
@@ -288,7 +329,7 @@ class TvVideoPlaybackStarter(
                     catalogTracks = effectiveVersion?.subtitleTracks.orEmpty(),
                     plannedTracks = resolved.subtitleUrls.orEmpty(),
                 ),
-                preferredAudioLanguage = preferredAudioLanguage ?: activeProfile?.language,
+                preferredAudioLanguage = effectivePreferredAudioLanguage ?: "en",
                 // Blank normalizes to null on every rung: a canonical row
                 // holding JSON null ("no preference") arrives here as a
                 // present-but-empty string, and TV auto-selection reads a
@@ -337,6 +378,27 @@ class TvVideoPlaybackStarter(
     private companion object {
         const val TAG = "TvVideoPlaybackStarter"
     }
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+internal fun resolveTvInitialAudioTrackIndex(
+    requestedAudioIndex: Int?,
+    carriedAudioIndex: Int?,
+    unresolvedCarriedChoice: Boolean,
+    tracks: List<org.siloserver.silo.model.catalog.AudioTrack>,
+    durableAudioFingerprint: String?,
+    preferredAudioLanguage: String?,
+    capabilities: ClientCodecCapabilities,
+): Int? {
+    requestedAudioIndex?.let { return it }
+    carriedAudioIndex?.let { return it }
+    if (unresolvedCarriedChoice) return null
+    return resolveAudioTrackOrdinal(tracks, durableAudioFingerprint)
+        ?: TrackSelectionPresets.selectBestCompatibleAudioTrackOrdinal(
+            tracks = tracks,
+            preferredAudioLanguage = preferredAudioLanguage,
+            capabilities = capabilities,
+        )
 }
 
 internal fun resolveTvSourceStartPosition(
@@ -406,6 +468,20 @@ fun resolveTvPlaybackStartSelection(
         audioTrackIndex = resolvedAudioIndex,
     )
 }
+
+/**
+ * Playback authority for audio at launch. A track chosen on the movie/show
+ * detail is title-level intent and therefore outranks both a carried episode
+ * choice and the global language/quality preference. The preference is only
+ * the fallback when neither manual source supplied a track.
+ */
+internal fun resolveTvStartAudioTrackIndex(
+    requestedTitleTrackIndex: Int?,
+    episodeHandoffTrackIndex: Int?,
+    automaticPreferenceTrackIndex: Int?,
+): Int? = requestedTitleTrackIndex
+    ?: episodeHandoffTrackIndex
+    ?: automaticPreferenceTrackIndex
 
 /** Converts the client-side selection to the server's non-negative index contract. */
 fun resolveTvServerSubtitleTrackIndex(

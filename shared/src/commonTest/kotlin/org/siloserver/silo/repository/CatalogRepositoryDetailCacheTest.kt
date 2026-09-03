@@ -1,5 +1,6 @@
 package org.siloserver.silo.repository
 
+import org.siloserver.silo.model.catalog.EpisodesResponse
 import org.siloserver.silo.model.catalog.ItemDetail
 import org.siloserver.silo.model.catalog.SeasonsResponse
 import org.siloserver.silo.network.ApiResult
@@ -18,9 +19,15 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.serialization.kotlinx.json.json
-import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -31,6 +38,7 @@ class CatalogRepositoryDetailCacheTest {
     private class FakeCache(
         val preset: ItemDetail? = null,
         val seasonsPreset: SeasonsResponse? = null,
+        val episodesPreset: EpisodesResponse? = null,
         val identityTransitions: IdentityTransitionBarrier? = null,
         val beforeItemCache: suspend () -> Unit = {},
     ) : CatalogCachePort {
@@ -50,6 +58,10 @@ class CatalogRepositoryDetailCacheTest {
         }
         override suspend fun getCachedItemDetail(contentId: String): ItemDetail? = preset
         override suspend fun getCachedSeasons(seriesId: String): SeasonsResponse? = seasonsPreset
+        override suspend fun getCachedEpisodes(
+            seriesId: String,
+            seasonNumber: Int,
+        ): EpisodesResponse? = episodesPreset
     }
 
     private fun repo(status: HttpStatusCode, body: String, cache: CatalogCachePort): CatalogRepository {
@@ -68,6 +80,32 @@ class CatalogRepositoryDetailCacheTest {
             install(ContentNegotiation) { json(SiloJson) }
         }
         return CatalogRepository(CatalogApi(client), cache)
+    }
+
+    private fun gatedRepository(
+        requestDispatcher: CoroutineDispatcher,
+        requestEntered: CompletableDeferred<Unit>,
+        releaseResponse: CompletableDeferred<Unit>,
+        onRequest: () -> Unit,
+    ): CatalogRepository {
+        val client = HttpClient(
+            MockEngine {
+                onRequest()
+                requestEntered.complete(Unit)
+                releaseResponse.await()
+                respond(
+                    """{"content_id":"c1","type":"movie","title":"A"}""",
+                    HttpStatusCode.OK,
+                    headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+            },
+        ) {
+            install(ContentNegotiation) { json(SiloJson) }
+        }
+        return CatalogRepository(
+            catalogApi = CatalogApi(client),
+            requestDispatcher = requestDispatcher,
+        )
     }
 
     @Test
@@ -111,6 +149,65 @@ class CatalogRepositoryDetailCacheTest {
     }
 
     @Test
+    fun seasonAndEpisodePrefetchUseCacheWithoutNetwork() = runTest {
+        val cache = FakeCache(
+            seasonsPreset = SeasonsResponse(),
+            episodesPreset = EpisodesResponse(),
+        )
+        val repository = repoThatFailsOnNetwork(cache)
+
+        assertTrue(repository.getSeasonsForPrefetch("series-1") is ApiResult.Success)
+        assertTrue(repository.getEpisodesForPrefetch("series-1", 3) is ApiResult.Success)
+    }
+
+    @Test
+    fun destinationJoinsActiveDetailWarmup() = runTest {
+        var calls = 0
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val repository = gatedRepository(
+            requestDispatcher = StandardTestDispatcher(testScheduler),
+            requestEntered = entered,
+            releaseResponse = release,
+            onRequest = { calls += 1 },
+        )
+
+        val requests = listOf(
+            async { repository.warmItemDetail("c1") },
+            async { repository.getItemDetail("c1") },
+        )
+        entered.await()
+        repeat(10) { yield() }
+        release.complete(Unit)
+        requests.awaitAll()
+
+        assertEquals(1, calls)
+    }
+
+    @Test
+    fun cancelingHomePrefetchDoesNotCancelDestinationDetailRequest() = runTest {
+        var calls = 0
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val repository = gatedRepository(
+            requestDispatcher = StandardTestDispatcher(testScheduler),
+            requestEntered = entered,
+            releaseResponse = release,
+            onRequest = { calls += 1 },
+        )
+
+        val homePrefetch = launch { repository.warmItemDetail("c1") }
+        entered.await()
+        val destination = async { repository.getItemDetail("c1") }
+        repeat(10) { yield() }
+        homePrefetch.cancelAndJoin()
+        release.complete(Unit)
+
+        assertTrue(destination.await() is ApiResult.Success)
+        assertEquals(1, calls)
+    }
+
+    @Test
     fun doesNotServeCacheOn4xx() = runTest {
         val cache = FakeCache(preset = ItemDetail(contentId = "c1", type = "movie", title = "Cached"))
         val result = repo(HttpStatusCode.NotFound, "{}", cache).getItemDetail("c1")
@@ -122,6 +219,20 @@ class CatalogRepositoryDetailCacheTest {
         val cache = FakeCache(seasonsPreset = SeasonsResponse(seasons = emptyList()))
         val result = repo(HttpStatusCode.ServiceUnavailable, "{}", cache).getSeasons("series-1")
         assertTrue(result is ApiResult.Success)
+    }
+
+    @Test
+    fun continueWatchingSeasonPrefetchUsesCachedNavigationWithoutNetwork() = runTest {
+        val cache = FakeCache(
+            seasonsPreset = SeasonsResponse(seasons = emptyList()),
+            episodesPreset = EpisodesResponse(episodes = emptyList()),
+        )
+        val repository = repoThatFailsOnNetwork(cache)
+
+        assertTrue(repository.getSeasonsForPrefetch("series-1") is ApiResult.Success)
+        assertTrue(repository.getEpisodesForPrefetch("series-1", 3) is ApiResult.Success)
+        assertEquals(cache.seasonsPreset, repository.getCachedSeasons("series-1"))
+        assertEquals(cache.episodesPreset, repository.getCachedEpisodes("series-1", 3))
     }
 
     @Test
